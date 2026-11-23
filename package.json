@@ -1,0 +1,26 @@
+{
+  "name": "github-pr-bot",
+  "version": "1.0.0",
+  "description": "Discord bot to manage GitHub Pull Requests",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "deploy-commands": "tsx src/deploy-commands.ts",
+    "test": "tsx test/run-tests.ts"
+  },
+  "keywords": ["discord", "github", "pull-request", "bot", "typescript"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@octokit/rest": "^21.1.1",
+    "discord.js": "^14.18.0",
+    "dotenv": "^16.4.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.9",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}
