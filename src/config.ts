@@ -1,5 +1,4 @@
 import dotenv from 'dotenv';
-import path from 'path';
 
 dotenv.config();
 
@@ -10,27 +9,21 @@ export interface RepoConfig {
   targetBranch: string; // e.g. "main" or "develop"
 }
 
+export interface DbConfig {
+  host: string;
+  port: number;
+  user: string;
+  password?: string;
+  database: string;
+}
+
 export interface AppConfig {
   discordToken: string;
   discordClientId: string;
-  prNotificationChannelId?: string;
-  notifierIds: string[];
-  githubToken: string;
-  defaultTargetBranch: string;
-  repositories: RepoConfig[];
-  dataPath: string;
+  db: DbConfig;
 }
 
-export function parseNotifierIds(raw: string | undefined): string[] {
-  if (!raw || raw.trim() === '') return [];
-  const matches = [...raw.matchAll(/<@!?(\d+)>|\b(\d{17,20})\b/g)];
-  if (matches.length > 0) {
-    return Array.from(new Set(matches.map(m => m[1] || m[2])));
-  }
-  return raw.split(',').map(s => s.trim().replace(/^<@!?/, '').replace(/>$/, '')).filter(Boolean);
-}
-
-export function parseRepositories(repoStr: string | undefined, defaultTarget: string): RepoConfig[] {
+export function parseRepositories(repoStr: string | undefined, defaultTarget: string = 'QA'): RepoConfig[] {
   if (!repoStr || repoStr.trim() === '') {
     return [];
   }
@@ -92,25 +85,28 @@ export function parseRepositories(repoStr: string | undefined, defaultTarget: st
 export function loadConfig(): AppConfig {
   const discordToken = process.env.DISCORD_TOKEN || '';
   const discordClientId = process.env.DISCORD_CLIENT_ID || '';
-  const prNotificationChannelId = (process.env.PR_NOTIFICATION_CHANNEL_ID || process.env.NOTIFICATION_CHANNEL_ID || '').trim() || undefined;
-  const notifierIds = parseNotifierIds(process.env.NOTIFIER_IDS || process.env.NOTIFIERS || '');
-  const githubToken = process.env.GITHUB_TOKEN || '';
-  const defaultTargetBranch = process.env.DEFAULT_TARGET_BRANCH || 'main';
-  const repositoriesRaw = process.env.REPOSITORIES || '';
 
-  const repositories = parseRepositories(repositoriesRaw, defaultTargetBranch);
-  const dataPath = path.resolve(process.cwd(), 'data', 'user-branches.json');
+  const db: DbConfig = {
+    host: process.env.DB_HOST || 'localhost',
+    port: parseInt(process.env.DB_PORT || '3306', 10),
+    user: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'discord_pr_bot',
+  };
 
   return {
     discordToken,
     discordClientId,
-    prNotificationChannelId,
-    notifierIds,
-    githubToken,
-    defaultTargetBranch,
-    repositories,
-    dataPath,
+    db,
   };
+}
+
+export function isChannelAllowed(
+  targetChannelId: string | null | undefined,
+  configuredChannelId: string | null | undefined
+): boolean {
+  if (!configuredChannelId) return true;
+  return targetChannelId === configuredChannelId;
 }
 
 export const config = loadConfig();

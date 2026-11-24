@@ -1,9 +1,5 @@
 import { Octokit } from '@octokit/rest';
-
-interface CacheEntry {
-  branches: string[];
-  expiresAt: number;
-}
+import { UserCacheService } from './cache';
 
 export interface CreatePRParams {
   owner: string;
@@ -21,25 +17,43 @@ export interface PRResult {
   state: string;
 }
 
+export interface BranchCompareResult {
+  hasChanges: boolean;
+  aheadBy: number;
+  behindBy: number;
+  status: string; // 'ahead' | 'behind' | 'identical' | 'diverged'
+  totalCommits: number;
+  filesCount: number;
+  errorMessage?: string;
+}
+
 export class GitHubService {
   private octokit: Octokit;
-  // In-memory cache for remote branches: repoFullName -> CacheEntry (5 minutes TTL)
-  private branchCache = new Map<string, CacheEntry>();
-  private readonly CACHE_TTL_MS = 5 * 60 * 1000;
+  private userCache?: UserCacheService;
 
-  constructor(token: string) {
+  constructor(token: string, userCache?: UserCacheService) {
     this.octokit = new Octokit({
       auth: token || undefined,
     });
+    this.userCache = userCache;
   }
 
-  public async listBranches(owner: string, repo: string): Promise<string[]> {
-    const key = `${owner}/${repo}`.toLowerCase();
-    const now = Date.now();
-    const cached = this.branchCache.get(key);
+  public setUserCacheService(userCache: UserCacheService): void {
+    this.userCache = userCache;
+  }
 
-    if (cached && cached.expiresAt > now) {
-      return cached.branches;
+  /**
+   * List remote branches with server-side [user_id, cache] support
+   */
+  public async listBranches(owner: string, repo: string, userId?: string): Promise<string[]> {
+    const repoFullName = `${owner}/${repo}`.toLowerCase();
+
+    // Check user cache first if userId provided
+    if (userId && this.userCache) {
+      const cached = this.userCache.getCachedBranches(userId, repoFullName);
+      if (cached) {
+        return cached;
+      }
     }
 
     try {
@@ -65,15 +79,69 @@ export class GitHubService {
         page++;
       }
 
-      this.branchCache.set(key, {
-        branches,
-        expiresAt: now + this.CACHE_TTL_MS,
-      });
+      if (userId && this.userCache) {
+        this.userCache.setCachedBranches(userId, repoFullName, branches);
+      }
 
       return branches;
     } catch (err: any) {
       console.error(`[GitHubService] Error fetching branches for ${owner}/${repo}:`, err.message || err);
       return [];
+    }
+  }
+
+  /**
+   * Compare branch (head) against base branch to verify whether changes exist
+   */
+  public async compareBranchWithBase(
+    owner: string,
+    repo: string,
+    head: string,
+    base: string
+  ): Promise<BranchCompareResult> {
+    try {
+      const res = await this.octokit.rest.repos.compareCommits({
+        owner,
+        repo,
+        base,
+        head,
+      });
+
+      const aheadBy = res.data.ahead_by ?? 0;
+      const behindBy = res.data.behind_by ?? 0;
+      const status = res.data.status ?? 'unknown';
+      const totalCommits = res.data.total_commits ?? 0;
+      const filesCount = res.data.files ? res.data.files.length : 0;
+
+      // If head is ahead of base by >= 1 commit or has changed files
+      const hasChanges = aheadBy > 0 || filesCount > 0;
+
+      return {
+        hasChanges,
+        aheadBy,
+        behindBy,
+        status,
+        totalCommits,
+        filesCount,
+      };
+    } catch (err: any) {
+      const errorMsg = err.response?.data?.message || err.message || 'Error comparing branch with base';
+      const status = err.status || err.response?.status;
+
+      let userFriendlyMsg = errorMsg;
+      if (status === 404) {
+        userFriendlyMsg = `Branch \`${head}\` or target branch \`${base}\` was not found on remote GitHub. Please check that your branch is pushed.`;
+      }
+
+      return {
+        hasChanges: false,
+        aheadBy: 0,
+        behindBy: 0,
+        status: 'error',
+        totalCommits: 0,
+        filesCount: 0,
+        errorMessage: userFriendlyMsg,
+      };
     }
   }
 

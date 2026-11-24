@@ -9,15 +9,16 @@ import {
   ButtonBuilder,
   ButtonStyle,
 } from 'discord.js';
-import { AppConfig, RepoConfig } from '../config';
-import { StorageService } from '../services/storage';
-import { GitHubService } from '../services/github';
+import { RepoConfig } from '../config';
+import { GuildRuntimeConfig, GuildService } from '../services/guild-service';
 
 export function buildPrConfirmationCard(
   repoConfig: RepoConfig,
   fromBranch: string,
-  notifierCount = 0
+  channelId?: string
 ) {
+  const channelText = channelId ? `<#${channelId}>` : 'this channel';
+
   const embed = new EmbedBuilder()
     .setTitle(`Ready to Create Pull Request`)
     .setColor(0x2b2d31)
@@ -25,18 +26,14 @@ export function buildPrConfirmationCard(
     .addFields(
       { name: 'Repository', value: `\`${repoConfig.fullName}\``, inline: false },
       { name: 'From Branch (Head)', value: `\`${fromBranch}\``, inline: true },
-      { name: 'To Branch (Base)', value: `\`${repoConfig.targetBranch}\``, inline: true }
-    );
-
-  if (notifierCount > 0) {
-    embed.addFields({
-      name: '📢 Notifiers (.env)',
-      value: `*${notifierCount} Discord user(s) will receive a direct message with the PR link.*`,
-      inline: false,
-    });
-  }
-
-  embed.setFooter({ text: 'Clicking submit will open a modal for PR Title and Description' });
+      { name: 'To Branch (Base)', value: `\`${repoConfig.targetBranch}\``, inline: true },
+      {
+        name: '📢 Public Announcement',
+        value: `*Upon submission, the PR link will be posted in ${channelText} for everyone to see.*`,
+        inline: false,
+      }
+    )
+    .setFooter({ text: 'PR will be opened under your personal GitHub account' });
 
   const submitBtn = new ButtonBuilder()
     .setCustomId(`pr_open_modal:${repoConfig.fullName}`)
@@ -56,8 +53,8 @@ export function buildPrConfirmationCard(
 
 export async function handlePrButtonInteraction(
   interaction: ButtonInteraction,
-  config: AppConfig,
-  storage: StorageService
+  guildConfig: GuildRuntimeConfig,
+  guildService: GuildService
 ) {
   if (interaction.customId === 'pr_cancel') {
     await interaction.update({
@@ -69,8 +66,10 @@ export async function handlePrButtonInteraction(
   }
 
   if (interaction.customId.startsWith('pr_open_modal:')) {
+    if (!interaction.guildId) return;
+
     const repoFullName = interaction.customId.replace('pr_open_modal:', '');
-    const repoConfig = config.repositories.find(
+    const repoConfig = guildConfig.repositories.find(
       r => r.fullName.toLowerCase() === repoFullName.toLowerCase()
     );
 
@@ -82,10 +81,46 @@ export async function handlePrButtonInteraction(
       return;
     }
 
-    const fromBranch = storage.getUserBranch(interaction.user.id, repoConfig.fullName);
-    if (!fromBranch) {
+    const branchConfig = await guildService.getUserBranchConfig(interaction.guildId, interaction.user.id, repoConfig.fullName);
+    if (!branchConfig || !branchConfig.branchName) {
       await interaction.reply({
-        content: `⚠️ No working branch found for **${repoConfig.fullName}**. Please run \`/set-branch\` first.`,
+        content: `⚠️ No working branches found for **${repoConfig.fullName}**. Please set your branches first.`,
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const gitHubService = await guildService.getUserGitHubService(interaction.user.id);
+    if (!gitHubService) {
+      const setTokenBtn = new ButtonBuilder()
+        .setCustomId('dm_btn_set_token')
+        .setLabel('Connect GitHub Token')
+        .setEmoji('🔑')
+        .setStyle(ButtonStyle.Primary);
+      const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(setTokenBtn);
+
+      await interaction.reply({
+        content: `❌ You must connect your personal GitHub token first so the PR is opened under your GitHub account.`,
+        components: [actionRow],
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // Pre-flight check: verify branch has changes compared to target branch before showing modal
+    const check = await gitHubService.compareBranchWithBase(
+      repoConfig.owner,
+      repoConfig.repo,
+      branchConfig.branchName,
+      branchConfig.targetBranch
+    );
+
+    if (!check.hasChanges) {
+      const reason =
+        check.errorMessage ||
+        `Branch \`${branchConfig.branchName}\` has 0 commits ahead of target branch \`${branchConfig.targetBranch}\` (no file changes).`;
+      await interaction.reply({
+        content: `⚠️ **Cannot create Pull Request:**\n${reason}\n\nPlease make sure your branch is pushed and has changes compared to \`${branchConfig.targetBranch}\`.`,
         ephemeral: true,
       });
       return;
@@ -95,7 +130,7 @@ export async function handlePrButtonInteraction(
       .setCustomId(`pr_submit_modal:${repoConfig.fullName}`)
       .setTitle(`Create PR: ${repoConfig.repo}`);
 
-    const defaultTitle = `Merge ${fromBranch} into ${repoConfig.targetBranch}`;
+    const defaultTitle = `Merge ${branchConfig.branchName} into ${branchConfig.targetBranch}`;
 
     const titleInput = new TextInputBuilder()
       .setCustomId('pr_title')
@@ -125,14 +160,14 @@ export async function handlePrButtonInteraction(
 
 export async function handlePrModalSubmit(
   interaction: ModalSubmitInteraction,
-  config: AppConfig,
-  storage: StorageService,
-  gitHubService: GitHubService
+  guildConfig: GuildRuntimeConfig,
+  guildService: GuildService
 ) {
   if (!interaction.customId.startsWith('pr_submit_modal:')) return;
+  if (!interaction.guildId) return;
 
   const repoFullName = interaction.customId.replace('pr_submit_modal:', '');
-  const repoConfig = config.repositories.find(
+  const repoConfig = guildConfig.repositories.find(
     r => r.fullName.toLowerCase() === repoFullName.toLowerCase()
   );
 
@@ -144,10 +179,19 @@ export async function handlePrModalSubmit(
     return;
   }
 
-  const fromBranch = storage.getUserBranch(interaction.user.id, repoConfig.fullName);
-  if (!fromBranch) {
+  const branchConfig = await guildService.getUserBranchConfig(interaction.guildId, interaction.user.id, repoConfig.fullName);
+  if (!branchConfig || !branchConfig.branchName) {
     await interaction.reply({
-      content: `⚠️ No working branch found for **${repoConfig.fullName}**.`,
+      content: `⚠️ No working branches found for **${repoConfig.fullName}**.`,
+      ephemeral: true,
+    });
+    return;
+  }
+
+  const gitHubService = await guildService.getUserGitHubService(interaction.user.id);
+  if (!gitHubService) {
+    await interaction.reply({
+      content: `❌ Personal GitHub token not found. Please run \`/set-token\` to connect your account.`,
       ephemeral: true,
     });
     return;
@@ -156,22 +200,40 @@ export async function handlePrModalSubmit(
   const title = interaction.fields.getTextInputValue('pr_title').trim();
   const description = interaction.fields.getTextInputValue('pr_description').trim();
 
-  // Defer reply ephemerally while creating the PR on GitHub
+  // Defer reply ephemerally while checking diff and creating PR
   await interaction.deferReply({ ephemeral: true });
 
   try {
+    // Secondary check: ensure branch has changes before opening PR
+    const check = await gitHubService.compareBranchWithBase(
+      repoConfig.owner,
+      repoConfig.repo,
+      branchConfig.branchName,
+      branchConfig.targetBranch
+    );
+
+    if (!check.hasChanges) {
+      const reason =
+        check.errorMessage ||
+        `Branch \`${branchConfig.branchName}\` has 0 commits ahead of target branch \`${branchConfig.targetBranch}\`.`;
+      await interaction.editReply({
+        content: `⚠️ **Cannot create Pull Request:**\n${reason}\n\nNo changes were found to merge into \`${branchConfig.targetBranch}\`.`,
+      });
+      return;
+    }
+
     const prResult = await gitHubService.createPullRequest({
       owner: repoConfig.owner,
       repo: repoConfig.repo,
-      head: fromBranch,
-      base: repoConfig.targetBranch,
+      head: branchConfig.branchName,
+      base: branchConfig.targetBranch,
       title,
       body: description
         ? `${description}\n\n---\n*Created via Discord Bot by @${interaction.user.username}*`
         : `*Created via Discord Bot by @${interaction.user.username}*`,
     });
 
-    // Public PR Embed to share
+    // Public PR Embed to share in configured channel
     const publicEmbed = new EmbedBuilder()
       .setTitle(`🚀 New Pull Request: #${prResult.number} ${prResult.title}`)
       .setURL(prResult.htmlUrl)
@@ -179,69 +241,38 @@ export async function handlePrModalSubmit(
       .setDescription(description || '*No description provided.*')
       .addFields(
         { name: 'Repository', value: `[${repoConfig.fullName}](https://github.com/${repoConfig.fullName})`, inline: true },
-        { name: 'Branches', value: `\`${fromBranch}\` ➔ \`${repoConfig.targetBranch}\``, inline: true },
+        { name: 'Branches', value: `\`${branchConfig.branchName}\` ➔ \`${branchConfig.targetBranch}\``, inline: true },
         { name: 'Author', value: `${interaction.user}`, inline: true }
       )
       .setFooter({ text: `GitHub Pull Request #${prResult.number} • Status: ${prResult.state.toUpperCase()}` })
       .setTimestamp();
 
     const notificationPayload = {
-      content: `🔔 **${interaction.user}** opened a new pull request: ${prResult.htmlUrl}`,
+      content: `📢 **${interaction.user}** opened a new pull request: ${prResult.htmlUrl}`,
       embeds: [publicEmbed],
     };
 
-    // 1. Send Direct Messages to all configured NOTIFIER_IDS in .env
-    const notifiedSuccess: string[] = [];
-    const notifiedFailed: string[] = [];
+    // Send normal public message into the configured working channel so everyone can see the link
+    const targetChannelId = guildConfig.channelId || interaction.channelId;
+    let channelAnnounced = false;
 
-    for (const userId of config.notifierIds) {
+    if (targetChannelId) {
       try {
-        const user = await interaction.client.users.fetch(userId);
-        if (user) {
-          await user.send({
-            content: `🔔 **${interaction.user.username}** opened a new pull request: ${prResult.htmlUrl}`,
-            embeds: [publicEmbed],
-          });
-          notifiedSuccess.push(user.toString());
-        }
-      } catch (err) {
-        console.error(`[Notifier Error] Failed to send DM to notifier ${userId}:`, err);
-        notifiedFailed.push(`<@${userId}>`);
-      }
-    }
-
-    // 2. Deliver to PR_NOTIFICATION_CHANNEL_ID (if configured)
-    let channelDeliveredLabel = '';
-    if (config.prNotificationChannelId) {
-      const targetId = config.prNotificationChannelId;
-      try {
-        const targetChannel = await interaction.client.channels.fetch(targetId).catch(() => null);
-        if (targetChannel && targetChannel.isTextBased() && 'send' in targetChannel) {
-          await (targetChannel as any).send(notificationPayload);
-          channelDeliveredLabel = 'name' in targetChannel ? `#${(targetChannel as any).name}` : 'target channel';
-        } else {
-          const targetUser = await interaction.client.users.fetch(targetId).catch(() => null);
-          if (targetUser) {
-            await targetUser.send(notificationPayload);
-            channelDeliveredLabel = `@${targetUser.username} (DM)`;
-          }
+        const channel = await interaction.client.channels.fetch(targetChannelId);
+        if (channel && channel.isTextBased() && 'send' in channel) {
+          await (channel as any).send(notificationPayload);
+          channelAnnounced = true;
         }
       } catch (notifyErr: any) {
-        console.error(`[Notification Error] Failed to send notification to ID ${targetId}:`, notifyErr);
+        console.error(`[Notification Error] Failed to send public PR message to channel ${targetChannelId}:`, notifyErr);
       }
     }
 
-    // 3. Confirmation reply to author
-    let replyContent = `🎉 Successfully created Pull Request **#${prResult.number}**!\n🔗 ${prResult.htmlUrl}`;
-
-    if (notifiedSuccess.length > 0) {
-      replyContent += `\n📢 **Direct notification sent to notifiers (${notifiedSuccess.length}):** ${notifiedSuccess.join(', ')}`;
-    }
-    if (notifiedFailed.length > 0) {
-      replyContent += `\n⚠️ *Could not DM (${notifiedFailed.join(', ')}) - their DMs may be closed.*`;
-    }
-    if (channelDeliveredLabel) {
-      replyContent += `\n📣 Notification sent to: **${channelDeliveredLabel}**`;
+    // Confirmation reply to the author
+    const channelMention = targetChannelId ? `<#${targetChannelId}>` : 'the channel';
+    let replyContent = `🎉 Successfully created Pull Request **#${prResult.number}** under your GitHub account!\n🔗 ${prResult.htmlUrl}`;
+    if (channelAnnounced) {
+      replyContent += `\n\n📢 Announced in ${channelMention} so all team members can see it!`;
     }
 
     await interaction.editReply({
@@ -250,7 +281,7 @@ export async function handlePrModalSubmit(
   } catch (err: any) {
     console.error('[PR Creation Error]:', err);
     await interaction.editReply({
-      content: `❌ **Failed to create Pull Request on GitHub:**\n\`${err.message || 'Unknown error'}\`\n\nPlease verify that your branch \`${fromBranch}\` exists remotely on GitHub and has changes compared to \`${repoConfig.targetBranch}\`.`,
+      content: `❌ **Failed to create Pull Request on GitHub:**\n\`${err.message || 'Unknown error'}\`\n\nPlease verify that your branch \`${branchConfig.branchName}\` exists remotely on GitHub and has changes compared to \`${branchConfig.targetBranch}\`.`,
     });
   }
 }

@@ -5,14 +5,12 @@ import {
   InteractionContextType,
   ApplicationIntegrationType,
 } from 'discord.js';
-import { AppConfig } from '../config';
-import { StorageService } from '../services/storage';
-import { GitHubService } from '../services/github';
+import { GuildRuntimeConfig, GuildService } from '../services/guild-service';
 
 export const setBranchCommand = {
   data: new SlashCommandBuilder()
     .setName('set-branch')
-    .setDescription('Set your working (source) branch for a repository')
+    .setDescription('Configure your working branch (branch_name) and target branch (target_branch) for a repo')
     .setContexts([
       InteractionContextType.Guild,
       InteractionContextType.BotDM,
@@ -32,21 +30,28 @@ export const setBranchCommand = {
     .addStringOption(option =>
       option
         .setName('branch')
-        .setDescription('Your working branch name')
+        .setDescription('Your working branch name (branch_name)')
         .setRequired(true)
+        .setAutocomplete(true)
+    )
+    .addStringOption(option =>
+      option
+        .setName('target_branch')
+        .setDescription('Target branch to merge into (target_branch, e.g. QA or main)')
+        .setRequired(false)
         .setAutocomplete(true)
     ),
 
   async autocomplete(
     interaction: AutocompleteInteraction,
-    config: AppConfig,
-    gitHubService: GitHubService
+    guildConfig: GuildRuntimeConfig,
+    guildService: GuildService
   ) {
     const focusedOption = interaction.options.getFocused(true);
 
     if (focusedOption.name === 'repo') {
       const query = focusedOption.value.toLowerCase();
-      const filtered = config.repositories
+      const filtered = guildConfig.repositories
         .filter(r => r.fullName.toLowerCase().includes(query))
         .slice(0, 25);
 
@@ -56,12 +61,11 @@ export const setBranchCommand = {
       return;
     }
 
-    if (focusedOption.name === 'branch') {
+    if (focusedOption.name === 'branch' || focusedOption.name === 'target_branch') {
       const selectedRepoName = interaction.options.getString('repo');
       const query = focusedOption.value.toLowerCase();
 
       if (!selectedRepoName) {
-        // Can't suggest branches without repo selected
         if (query) {
           await interaction.respond([{ name: query, value: query }]);
         } else {
@@ -70,7 +74,7 @@ export const setBranchCommand = {
         return;
       }
 
-      const repoConfig = config.repositories.find(
+      const repoConfig = guildConfig.repositories.find(
         r => r.fullName.toLowerCase() === selectedRepoName.toLowerCase()
       );
 
@@ -83,14 +87,28 @@ export const setBranchCommand = {
         return;
       }
 
-      const remoteBranches = await gitHubService.listBranches(repoConfig.owner, repoConfig.repo);
+      // Use user's personal GitHub token if available
+      const gitHubService = await guildService.getUserGitHubService(interaction.user.id);
+      if (!gitHubService) {
+        if (query) {
+          await interaction.respond([{ name: query, value: query }]);
+        } else {
+          await interaction.respond([]);
+        }
+        return;
+      }
+
+      const remoteBranches = await gitHubService.listBranches(
+        repoConfig.owner,
+        repoConfig.repo,
+        interaction.user.id
+      );
       const filtered = remoteBranches
         .filter(b => b.toLowerCase().includes(query))
         .slice(0, 24);
 
       const suggestions = filtered.map(b => ({ name: b, value: b }));
 
-      // Allow typing a custom/new branch name if it's not already in suggestions
       if (query && !filtered.some(b => b.toLowerCase() === query)) {
         suggestions.unshift({ name: `Custom: "${query}"`, value: focusedOption.value });
       }
@@ -101,28 +119,44 @@ export const setBranchCommand = {
 
   async execute(
     interaction: ChatInputCommandInteraction,
-    config: AppConfig,
-    storage: StorageService
+    guildConfig: GuildRuntimeConfig,
+    guildService: GuildService
   ) {
-    const repoFullName = interaction.options.getString('repo', true);
-    const branch = interaction.options.getString('branch', true).trim();
+    if (!interaction.guildId) return;
 
-    const repoConfig = config.repositories.find(
+    const repoFullName = interaction.options.getString('repo', true);
+    const branchName = interaction.options.getString('branch', true).trim();
+    const existing = await guildService.getUserBranchConfig(interaction.guildId, interaction.user.id, repoFullName);
+
+    const repoConfig = guildConfig.repositories.find(
       r => r.fullName.toLowerCase() === repoFullName.toLowerCase()
     );
 
     if (!repoConfig) {
       await interaction.reply({
-        content: `❌ Unknown repository **${repoFullName}**. Please pick one of the repositories configured in the bot.`,
+        content: `❌ Unknown repository **${repoFullName}**. Please pick one of the repositories configured in this server.`,
         ephemeral: true,
       });
       return;
     }
 
-    storage.setUserBranch(interaction.user.id, repoConfig.fullName, branch);
+    const targetBranch = (
+      interaction.options.getString('target_branch') ||
+      existing?.targetBranch ||
+      repoConfig.targetBranch ||
+      'QA'
+    ).trim();
+
+    await guildService.setUserBranchConfig(
+      interaction.guildId,
+      interaction.user.id,
+      repoConfig.fullName,
+      branchName,
+      targetBranch
+    );
 
     await interaction.reply({
-      content: `✅ Saved your working branch for **${repoConfig.fullName}** as \`${branch}\`.\nWhen you run \`/pr repo:${repoConfig.fullName}\`, this branch will be used as the source branch.`,
+      content: `✅ Saved your branches in MySQL for **${repoConfig.fullName}**!\n• **Working Branch (branch_name):** \`${branchName}\`\n• **Target Branch (target_branch):** \`${targetBranch}\`\nWhen you run \`/pr repo:${repoConfig.fullName}\`, PR will be created from \`${branchName}\` into \`${targetBranch}\`.`,
       ephemeral: true,
     });
   },

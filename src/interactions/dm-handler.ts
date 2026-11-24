@@ -12,31 +12,33 @@ import {
   TextInputBuilder,
   TextInputStyle,
 } from 'discord.js';
-import { AppConfig } from '../config';
-import { StorageService } from '../services/storage';
+import { GuildRuntimeConfig, GuildService } from '../services/guild-service';
 import { buildPrConfirmationCard } from './modal-handler';
+import { buildSetTokenModal } from '../commands/set-token';
 
-export function buildDmDashboardEmbed(userUsername: string, config: AppConfig) {
+export function buildDmDashboardEmbed(userUsername: string, guildConfig: GuildRuntimeConfig) {
+  const channelText = guildConfig.channelId ? `<#${guildConfig.channelId}>` : 'this server';
+
   const embed = new EmbedBuilder()
-    .setTitle(`🤖 GitHub PR Bot — Direct Message Dashboard`)
+    .setTitle(`🤖 GitHub PR Bot — Control Panel`)
     .setDescription(
-      `Hello **${userUsername}**! You can manage your working branches and create Pull Requests directly here without being in a server.\n\n` +
-      `**Quick Actions:** Use the buttons below, or run slash commands like \`/pr\`, \`/set-branch\`, and \`/my-branches\` right in this chat.`
+      `Hello **${userUsername}**! You can manage your personal branches, GitHub token, and create Pull Requests directly here.\n\n` +
+      `**Quick Actions:** Use the buttons below, or run slash commands like \`/pr\`, \`/set-branch\`, \`/my-branches\`, and \`/set-token\` in ${channelText}.`
     )
     .setColor(0x5865f2)
     .setTimestamp();
 
-  if (config.repositories.length === 0) {
+  if (guildConfig.repositories.length === 0) {
     embed.addFields({
       name: '⚠️ Repositories',
-      value: 'No repositories configured in `.env` yet.',
+      value: 'No repositories configured for this server yet. An admin can run `/setup` to add repositories.',
     });
   } else {
-    const repoList = config.repositories
-      .map(r => `• **${r.fullName}** *(Target: \`${r.targetBranch}\`)*`)
+    const repoList = guildConfig.repositories
+      .map(r => `• **${r.fullName}**`)
       .join('\n');
     embed.addFields({
-      name: `📁 Configured Repositories (${config.repositories.length})`,
+      name: `📁 Configured Repositories (${guildConfig.repositories.length})`,
       value: repoList,
     });
   }
@@ -63,37 +65,54 @@ export function buildDmDashboardButtons() {
     .setEmoji('📋')
     .setStyle(ButtonStyle.Secondary);
 
+  const setTokenBtn = new ButtonBuilder()
+    .setCustomId('dm_btn_set_token')
+    .setLabel('My GitHub Token')
+    .setEmoji('🔑')
+    .setStyle(ButtonStyle.Secondary);
+
   return new ActionRowBuilder<ButtonBuilder>().addComponents(
     createPrBtn,
     setBranchBtn,
-    myBranchesBtn
+    myBranchesBtn,
+    setTokenBtn
   );
 }
 
-export function buildMyBranchesEmbed(
+export async function buildMyBranchesEmbed(
+  guildId: string,
   userId: string,
-  config: AppConfig,
-  storage: StorageService
+  guildConfig: GuildRuntimeConfig,
+  guildService: GuildService
 ) {
-  const userBranches = storage.getAllUserBranches(userId);
+  const branchConfigs = await guildService.getAllUserBranchConfigs(guildId, userId);
+  const userToken = await guildService.getUserToken(userId);
 
   const embed = new EmbedBuilder()
-    .setTitle(`📋 Your Working Branches`)
+    .setTitle(`📋 Your Working Branches & GitHub Status`)
     .setColor(0x5865f2)
     .setTimestamp();
 
-  if (config.repositories.length === 0) {
-    embed.setDescription('⚠️ No repositories are currently configured in `.env`.');
+  // Show user's GitHub Token status
+  let tokenStatus = '❌ *Not connected* (Click **My GitHub Token** to connect)';
+  if (userToken) {
+    const masked = userToken.length > 8 ? `${userToken.slice(0, 4)}••••${userToken.slice(-4)}` : '••••••••';
+    tokenStatus = `✅ Connected (\`${masked}\`) — PRs open with your personal account`;
+  }
+  embed.addFields({ name: '🔑 Personal GitHub Account Token', value: tokenStatus, inline: false });
+
+  if (guildConfig.repositories.length === 0) {
+    embed.setDescription('⚠️ No repositories are currently configured for this server.');
     return embed;
   }
 
-  const fields = config.repositories.map(repo => {
-    const savedBranch = userBranches[repo.fullName];
+  const fields = guildConfig.repositories.map(repo => {
+    const branchConfig = branchConfigs[repo.fullName.toLowerCase()];
     return {
       name: repo.fullName,
-      value: savedBranch
-        ? `🟢 From: \`${savedBranch}\` ➔ To: \`${repo.targetBranch}\``
-        : `⚪ *Not set* (Target: \`${repo.targetBranch}\`)\nClick **Set Branch** to configure`,
+      value: branchConfig
+        ? `🟢 **branch_name:** \`${branchConfig.branchName}\` ➔ **target_branch:** \`${branchConfig.targetBranch}\``
+        : `⚪ *Not set*\nClick **Set Branch** to configure`,
       inline: false,
     };
   });
@@ -102,14 +121,14 @@ export function buildMyBranchesEmbed(
   return embed;
 }
 
-export function buildRepoSelectMenuForPr(config: AppConfig) {
+export function buildRepoSelectMenuForPr(guildConfig: GuildRuntimeConfig) {
   const selectMenu = new StringSelectMenuBuilder()
     .setCustomId('dm_select_repo_pr')
     .setPlaceholder('Select a repository to create a PR')
     .addOptions(
-      config.repositories.slice(0, 25).map(r => ({
+      guildConfig.repositories.slice(0, 25).map(r => ({
         label: r.fullName,
-        description: `Target branch: ${r.targetBranch}`,
+        description: `Target branch configured in your user settings`,
         value: r.fullName,
         emoji: '📁',
       }))
@@ -118,14 +137,14 @@ export function buildRepoSelectMenuForPr(config: AppConfig) {
   return new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(selectMenu);
 }
 
-export function buildRepoSelectMenuForSetBranch(config: AppConfig) {
+export function buildRepoSelectMenuForSetBranch(guildConfig: GuildRuntimeConfig) {
   const selectMenu = new StringSelectMenuBuilder()
     .setCustomId('dm_select_repo_set_branch')
-    .setPlaceholder('Select a repository to configure your branch')
+    .setPlaceholder('Select a repository to configure branch_name & target_branch')
     .addOptions(
-      config.repositories.slice(0, 25).map(r => ({
+      guildConfig.repositories.slice(0, 25).map(r => ({
         label: r.fullName,
-        description: `Target branch: ${r.targetBranch}`,
+        description: `Set your branch_name and target_branch`,
         value: r.fullName,
         emoji: '🌿',
       }))
@@ -136,18 +155,16 @@ export function buildRepoSelectMenuForSetBranch(config: AppConfig) {
 
 export async function handleDirectMessage(
   message: Message,
-  config: AppConfig,
-  storage: StorageService
+  guildConfig: GuildRuntimeConfig,
+  guildService: GuildService
 ) {
-  if (message.author.bot) return;
-  // Only trigger on direct messages
-  if (!message.channel.isDMBased()) return;
+  if (message.author.bot || !message.guildId) return;
 
   const content = message.content.trim().toLowerCase();
 
   // 1. Menu / Start / Help
   if (['menu', 'start', 'help', '/menu', '/start', '/help'].includes(content)) {
-    const embed = buildDmDashboardEmbed(message.author.username, config);
+    const embed = buildDmDashboardEmbed(message.author.username, guildConfig);
     const actionRow = buildDmDashboardButtons();
     await message.reply({ embeds: [embed], components: [actionRow] });
     return;
@@ -155,11 +172,11 @@ export async function handleDirectMessage(
 
   // 2. PR Command as text: "/pr", "pr", "/create-pr"
   if (['/pr', 'pr', '/create-pr', 'create-pr'].includes(content)) {
-    if (config.repositories.length === 0) {
-      await message.reply('⚠️ No repositories configured in `.env`.');
+    if (guildConfig.repositories.length === 0) {
+      await message.reply('⚠️ No repositories configured for this server. Run `/setup` to add repositories.');
       return;
     }
-    const row = buildRepoSelectMenuForPr(config);
+    const row = buildRepoSelectMenuForPr(guildConfig);
     await message.reply({
       content: '📌 **Choose the repository for your Pull Request:**',
       components: [row],
@@ -169,13 +186,13 @@ export async function handleDirectMessage(
 
   // 3. Set Branch Command as text: "/set-branch", "set-branch", "/branch"
   if (['/set-branch', 'set-branch', '/branch', 'branch', '/setbranch', 'setbranch'].includes(content)) {
-    if (config.repositories.length === 0) {
-      await message.reply('⚠️ No repositories configured in `.env`.');
+    if (guildConfig.repositories.length === 0) {
+      await message.reply('⚠️ No repositories configured for this server. Run `/setup` to add repositories.');
       return;
     }
-    const row = buildRepoSelectMenuForSetBranch(config);
+    const row = buildRepoSelectMenuForSetBranch(guildConfig);
     await message.reply({
-      content: '📌 **Choose the repository you want to set your branch for:**',
+      content: '📌 **Choose the repository you want to set your branches for:**',
       components: [row],
     });
     return;
@@ -183,16 +200,16 @@ export async function handleDirectMessage(
 
   // 4. My Branches Command as text: "/my-branches", "my-branches", "branches"
   if (['/my-branches', 'my-branches', '/branches', 'branches', '/mybranches', 'mybranches'].includes(content)) {
-    const embed = buildMyBranchesEmbed(message.author.id, config, storage);
+    const embed = await buildMyBranchesEmbed(message.guildId, message.author.id, guildConfig, guildService);
     await message.reply({ embeds: [embed] });
     return;
   }
 
-  // 5. Any other text -> Helpful guidance
-  const embed = buildDmDashboardEmbed(message.author.username, config);
+  // 5. Any other text in working channel -> Helpful guidance
+  const embed = buildDmDashboardEmbed(message.author.username, guildConfig);
   const actionRow = buildDmDashboardButtons();
   await message.reply({
-    content: `💡 Tip: Click the **Create PR** button below, or type **pr**, **set-branch**, or **my-branches**.`,
+    content: `💡 Tip: Click the buttons below, or type **pr**, **set-branch**, **my-branches**, or **set-token**.`,
     embeds: [embed],
     components: [actionRow],
   });
@@ -200,29 +217,42 @@ export async function handleDirectMessage(
 
 export async function handleDmButton(
   interaction: ButtonInteraction,
-  config: AppConfig,
-  storage: StorageService
+  guildConfig: GuildRuntimeConfig,
+  guildService: GuildService
 ) {
-  const { customId, user } = interaction;
+  if (!interaction.guildId) return;
+  const { customId, user, guildId } = interaction;
 
   // 1. My Branches Button
   if (customId === 'dm_btn_my_branches') {
-    const embed = buildMyBranchesEmbed(user.id, config, storage);
+    const embed = await buildMyBranchesEmbed(guildId, user.id, guildConfig, guildService);
     await interaction.reply({ embeds: [embed], ephemeral: true });
     return;
   }
 
-  // 2. Create PR Button -> Show Repo Select Menu
+  // 2. Set Token Button
+  if (customId === 'dm_btn_set_token') {
+    const existing = await guildService.getUserToken(user.id);
+    let masked: string | undefined;
+    if (existing) {
+      masked = existing.length > 8 ? `${existing.slice(0, 4)}••••${existing.slice(-4)}` : '••••••••';
+    }
+    const modal = buildSetTokenModal(masked);
+    await interaction.showModal(modal);
+    return;
+  }
+
+  // 3. Create PR Button -> Show Repo Select Menu
   if (customId === 'dm_btn_create_pr') {
-    if (config.repositories.length === 0) {
+    if (guildConfig.repositories.length === 0) {
       await interaction.reply({
-        content: '⚠️ No repositories configured in `.env`.',
+        content: '⚠️ No repositories configured for this server. Run `/setup` to add repositories.',
         ephemeral: true,
       });
       return;
     }
 
-    const row = buildRepoSelectMenuForPr(config);
+    const row = buildRepoSelectMenuForPr(guildConfig);
     await interaction.reply({
       content: '📌 **Choose the repository for your Pull Request:**',
       components: [row],
@@ -231,19 +261,19 @@ export async function handleDmButton(
     return;
   }
 
-  // 3. Set Branch Button -> Show Repo Select Menu
+  // 4. Set Branch Button -> Show Repo Select Menu
   if (customId === 'dm_btn_set_branch') {
-    if (config.repositories.length === 0) {
+    if (guildConfig.repositories.length === 0) {
       await interaction.reply({
-        content: '⚠️ No repositories configured in `.env`.',
+        content: '⚠️ No repositories configured for this server. Run `/setup` to add repositories.',
         ephemeral: true,
       });
       return;
     }
 
-    const row = buildRepoSelectMenuForSetBranch(config);
+    const row = buildRepoSelectMenuForSetBranch(guildConfig);
     await interaction.reply({
-      content: '📌 **Choose the repository you want to set your branch for:**',
+      content: '📌 **Choose the repository you want to set your branches for:**',
       components: [row],
       ephemeral: true,
     });
@@ -253,19 +283,20 @@ export async function handleDmButton(
 
 export async function handleDmSelectMenu(
   interaction: StringSelectMenuInteraction,
-  config: AppConfig,
-  storage: StorageService
+  guildConfig: GuildRuntimeConfig,
+  guildService: GuildService
 ) {
-  const { customId, values, user } = interaction;
+  if (!interaction.guildId) return;
+  const { customId, values, user, guildId } = interaction;
   const repoFullName = values[0];
 
-  const repoConfig = config.repositories.find(
+  const repoConfig = guildConfig.repositories.find(
     r => r.fullName.toLowerCase() === repoFullName.toLowerCase()
   );
 
   if (!repoConfig) {
     await interaction.reply({
-      content: `❌ Repository **${repoFullName}** not found.`,
+      content: `❌ Repository **${repoFullName}** not found in this server's configuration.`,
       ephemeral: true,
     });
     return;
@@ -273,17 +304,65 @@ export async function handleDmSelectMenu(
 
   // A. Selected Repo for Creating PR
   if (customId === 'dm_select_repo_pr') {
-    const userFromBranch = storage.getUserBranch(user.id, repoConfig.fullName);
+    const branchConfig = await guildService.getUserBranchConfig(guildId, user.id, repoConfig.fullName);
 
-    if (!userFromBranch) {
+    if (!branchConfig || !branchConfig.branchName) {
       await interaction.update({
-        content: `⚠️ You haven't set your working branch for **${repoConfig.fullName}** yet.\nClick **Set Branch** or use \`/set-branch\` first!`,
+        content: `⚠️ You haven't set your branches for **${repoConfig.fullName}** yet.\nClick **Set Branch** or use \`/set-branch\` first!`,
         components: [],
       });
       return;
     }
 
-    const card = buildPrConfirmationCard(repoConfig, userFromBranch, config.notifierIds.length);
+    // Verify user has personal GitHub token connected
+    const userToken = await guildService.getUserToken(user.id);
+    if (!userToken) {
+      const setTokenBtn = new ButtonBuilder()
+        .setCustomId('dm_btn_set_token')
+        .setLabel('Connect GitHub Token')
+        .setEmoji('🔑')
+        .setStyle(ButtonStyle.Primary);
+      const actionRow = new ActionRowBuilder<ButtonBuilder>().addComponents(setTokenBtn);
+
+      await interaction.update({
+        content: `⚠️ You must connect your personal GitHub token before creating a PR so it opens under your own account.`,
+        components: [actionRow],
+      });
+      return;
+    }
+
+    const userGitHubService = await guildService.getUserGitHubService(user.id);
+
+    // If GitHubService is available, verify branch changes
+    if (userGitHubService) {
+      const check = await userGitHubService.compareBranchWithBase(
+        repoConfig.owner,
+        repoConfig.repo,
+        branchConfig.branchName,
+        branchConfig.targetBranch
+      );
+
+      if (!check.hasChanges) {
+        const reason =
+          check.errorMessage ||
+          `Branch \`${branchConfig.branchName}\` has 0 commits ahead of target branch \`${branchConfig.targetBranch}\` (no file changes).`;
+        await interaction.update({
+          content: `⚠️ **Cannot create Pull Request:**\n${reason}\n\nPlease push your commits to \`${branchConfig.branchName}\` before creating a PR.`,
+          embeds: [],
+          components: [],
+        });
+        return;
+      }
+    }
+
+    const card = buildPrConfirmationCard(
+      {
+        ...repoConfig,
+        targetBranch: branchConfig.targetBranch,
+      },
+      branchConfig.branchName,
+      guildConfig.channelId
+    );
 
     await interaction.update({
       content: '',
@@ -293,25 +372,37 @@ export async function handleDmSelectMenu(
     return;
   }
 
-  // B. Selected Repo for Setting Branch -> Open Modal to input branch name
+  // B. Selected Repo for Setting Branch -> Open Modal with TWO fields: branch_name and target_branch
   if (customId === 'dm_select_repo_set_branch') {
-    const currentBranch = storage.getUserBranch(user.id, repoConfig.fullName) || '';
+    const existing = await guildService.getUserBranchConfig(guildId, user.id, repoConfig.fullName);
+    const currentBranchName = existing?.branchName || '';
+    const currentTargetBranch = existing?.targetBranch || repoConfig.targetBranch || 'QA';
 
     const modal = new ModalBuilder()
       .setCustomId(`dm_modal_set_branch:${repoConfig.fullName}`)
       .setTitle(`Set Branch: ${repoConfig.repo}`);
 
-    const branchInput = new TextInputBuilder()
+    const branchNameInput = new TextInputBuilder()
       .setCustomId('branch_name_input')
       .setLabel('Your Working (From) Branch Name')
       .setStyle(TextInputStyle.Short)
       .setPlaceholder('e.g. feature/my-feature or branch-01')
-      .setValue(currentBranch)
+      .setValue(currentBranchName)
       .setRequired(true)
       .setMaxLength(100);
 
-    const row = new ActionRowBuilder<TextInputBuilder>().addComponents(branchInput);
-    modal.addComponents(row);
+    const targetBranchInput = new TextInputBuilder()
+      .setCustomId('target_branch_input')
+      .setLabel('Target (To / Base) Branch Name')
+      .setStyle(TextInputStyle.Short)
+      .setPlaceholder('e.g. QA or main')
+      .setValue(currentTargetBranch)
+      .setRequired(true)
+      .setMaxLength(100);
+
+    const row1 = new ActionRowBuilder<TextInputBuilder>().addComponents(branchNameInput);
+    const row2 = new ActionRowBuilder<TextInputBuilder>().addComponents(targetBranchInput);
+    modal.addComponents(row1, row2);
 
     await interaction.showModal(modal);
   }
@@ -319,13 +410,14 @@ export async function handleDmSelectMenu(
 
 export async function handleDmModalSubmit(
   interaction: ModalSubmitInteraction,
-  config: AppConfig,
-  storage: StorageService
+  guildConfig: GuildRuntimeConfig,
+  guildService: GuildService
 ) {
+  if (!interaction.guildId) return;
   if (!interaction.customId.startsWith('dm_modal_set_branch:')) return;
 
   const repoFullName = interaction.customId.replace('dm_modal_set_branch:', '');
-  const repoConfig = config.repositories.find(
+  const repoConfig = guildConfig.repositories.find(
     r => r.fullName.toLowerCase() === repoFullName.toLowerCase()
   );
 
@@ -337,11 +429,19 @@ export async function handleDmModalSubmit(
     return;
   }
 
-  const branch = interaction.fields.getTextInputValue('branch_name_input').trim();
-  storage.setUserBranch(interaction.user.id, repoConfig.fullName, branch);
+  const branchName = interaction.fields.getTextInputValue('branch_name_input').trim();
+  const targetBranch = interaction.fields.getTextInputValue('target_branch_input').trim() || repoConfig.targetBranch || 'QA';
+
+  await guildService.setUserBranchConfig(
+    interaction.guildId,
+    interaction.user.id,
+    repoConfig.fullName,
+    branchName,
+    targetBranch
+  );
 
   await interaction.reply({
-    content: `✅ Saved your working branch for **${repoConfig.fullName}** as \`${branch}\`!\nTarget branch is \`${repoConfig.targetBranch}\`.\nYou can now click **Create PR** or use \`/pr\` anytime!`,
+    content: `✅ Saved in MySQL for **${repoConfig.fullName}**!\n• **branch_name:** \`${branchName}\`\n• **target_branch:** \`${targetBranch}\`\nYou can now click **Create PR** or use \`/pr\` anytime!`,
     ephemeral: true,
   });
 }

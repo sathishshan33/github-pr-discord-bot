@@ -4,7 +4,7 @@ import {
   InteractionContextType,
   ApplicationIntegrationType,
 } from 'discord.js';
-import { AppConfig } from '../config';
+import { GuildRuntimeConfig } from '../services/guild-service';
 import { buildDmDashboardEmbed, buildDmDashboardButtons } from '../interactions/dm-handler';
 
 export const menuCommand = {
@@ -23,9 +23,9 @@ export const menuCommand = {
 
   async execute(
     interaction: ChatInputCommandInteraction,
-    config: AppConfig
+    guildConfig: GuildRuntimeConfig
   ) {
-    const embed = buildDmDashboardEmbed(interaction.user.username, config);
+    const embed = buildDmDashboardEmbed(interaction.user.username, guildConfig);
     const actionRow = buildDmDashboardButtons();
 
     await interaction.reply({
